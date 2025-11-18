@@ -15,7 +15,7 @@ The app:
 ---
 ## Acknowledgment & Inspiration
 
-This project is an homage to the anterior chamber cell quantification workflow pioneered by Francesco Pichi, M.D.**, who introduced a widely adopted **ImageJ macro–based method** for AC inflammation analysis in swept-source optical biometry and OCT systems.
+This project is an homage to the anterior chamber cell quantification workflow pioneered by Francesco Pichi, M.D. Associate Professor of Ophthalmology, who introduced a widely adopted **ImageJ macro–based method** for AC inflammation analysis in swept-source optical biometry and OCT systems.
 
 His approach to:
 - defining reproducible ROI geometry,
