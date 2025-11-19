@@ -123,10 +123,9 @@ def refine_axis_skip_center(xs_raw,
 # -------------------------
 # Cornea/Lens mask extraction
 # -------------------------
-
 def get_cornea_lens_masks(img, k=2.0, min_area_ratio=0.001):
     """
-    Separate bright cornea and bright lens blobs.
+    Detect 2 bright blobs (cornea & lens) by sorting blobs by x-position.
     """
     h, w = img.shape
     mean = img.mean()
@@ -141,30 +140,23 @@ def get_cornea_lens_masks(img, k=2.0, min_area_ratio=0.001):
         raise RuntimeError("Could not detect ≥2 bright blobs. Try lowering k.")
 
     min_area = h * w * min_area_ratio
-    left_candidates = []
-    right_candidates = []
 
-    for r in regs:
-        if r.area < min_area:
-            continue
-        y0, x0, y1, x1 = r.bbox
-        cx = (x0 + x1) / 2.0
-        if cx < w / 2:
-            left_candidates.append((r.area, r))
-        else:
-            right_candidates.append((r.area, r))
+    # keep only large blobs
+    big = [r for r in regs if r.area >= min_area]
+    if len(big) < 2:
+        raise RuntimeError("Not enough large bright blobs (need ≥2).")
 
-    if not left_candidates or not right_candidates:
-        raise RuntimeError("Failed to detect cornea (left) or lens (right) blob.")
+    # sort them by leftmost x (r.bbox = (y0, x0, y1, x1))
+    big_sorted = sorted(big, key=lambda r: r.bbox[1])
 
-    cornea_r = max(left_candidates)[1]
-    lens_r   = max(right_candidates)[1]
+    # leftmost = cornea, next = lens
+    cornea_r = big_sorted[0]
+    lens_r   = big_sorted[1]
 
     cornea_mask = (lbl == cornea_r.label)
     lens_mask   = (lbl == lens_r.label)
 
     return cornea_mask, lens_mask
-
 
 # -------------------------
 # 1D smoothing
@@ -389,6 +381,8 @@ if uploaded is None:
     st.stop()
 
 img_orig = to_gray_np(uploaded)
+# 작업용 이미지 (필요시 오른쪽을 잘라가면서 사용)
+img_work = img_orig.copy()
 h_img, w_img = img_orig.shape
 
 st.sidebar.header("1. NL-means Denoising")
@@ -423,10 +417,19 @@ step = st.radio(
 # -------------------------
 
 # 1) NLM
-img_nlm = nlm_denoise(img_orig, h_factor, patch_size, patch_distance)
+img_nlm = nlm_denoise(
+    img_work,
+    h_factor=h_factor,
+    patch_size=patch_size,
+    patch_distance=patch_distance,
+)
 
 # 2) Beam removal
-img_beam_removed, beam_band = remove_central_beam(img_nlm, band_half=beam_half)
+img_beam_removed, beam_band = remove_central_beam(
+    img_nlm,
+    band_half=beam_half,
+)
+
 beam_y0, beam_y1 = beam_band
 
 # 3) AC ROI detection
@@ -439,37 +442,64 @@ binary = None
 overlay_roi = None
 overlay_full = None
 
-try:
-    cornea_mask_raw, lens_mask = get_cornea_lens_masks(img_nlm, k=k_val)
+img_nlm_work = img_nlm.copy()
+img_beam_work = img_beam_removed.copy()
 
-    cornea_post_mask, xs_cornea = get_posterior_cornea_mask(cornea_mask_raw, dilate_r=1)
-    xs_lens = get_anterior_lens_axis(lens_mask)
+crop_info = ""
+max_tries = 3
 
-    xs_cornea = refine_axis_skip_center(
-        xs_cornea,
-        beam_band=beam_band,
-        center_pad=5,
-        max_step=4,
-        min_len=40,
-    )
+for attempt in range(max_tries):
+    try:
+        # --- 이 아래는 기존 try 블록과 동일하지만
+        #     img_nlm 대신 img_nlm_work, img_beam_removed 대신 img_beam_work 사용 ---
+        cornea_mask_raw, lens_mask = get_cornea_lens_masks(img_nlm_work, k=k_val)
 
-    ac_mask = build_ac_mask_with_chords(
-        img_shape=img_nlm.shape,
-        xs_cornea_raw=xs_cornea,
-        xs_lens_raw=xs_lens,
-        min_width=min_width,
-    )
+        cornea_post_mask, xs_cornea = get_posterior_cornea_mask(cornea_mask_raw, dilate_r=1)
+        xs_lens = get_anterior_lens_axis(lens_mask)
 
-    ys, xs = np.where(ac_mask)
-    yy0 = ys.min()
-    yy1 = ys.max() + 1
-    x0  = xs.min()
-    x1  = xs.max() + 1
+        xs_cornea = refine_axis_skip_center(
+            xs_cornea,
+            beam_band=beam_band,
+            center_pad=5,
+            max_step=4,
+            min_len=40,
+        )
 
-except Exception as e:
-    error_msg = str(e)
+        ac_mask = build_ac_mask_with_chords(
+            img_shape=img_nlm_work.shape,
+            xs_cornea_raw=xs_cornea,
+            xs_lens_raw=xs_lens,
+            min_width=min_width,
+        )
 
-# 4) Threshold & cell detection
+        ys, xs = np.where(ac_mask)
+        yy0 = ys.min()
+        yy1 = ys.max() + 1
+        x0  = xs.min()
+        x1  = xs.max() + 1
+
+        # 성공했으면 루프 탈출
+        error_msg = None
+        break
+
+    except Exception as e:
+        error_msg = str(e)
+
+        # 마지막 시도면 그냥 포기
+        if attempt == max_tries - 1:
+            break
+
+        # 👉 오른쪽 1/3 잘라내고 다시 시도
+        h, w = img_nlm_work.shape
+        new_w = int(w * (2.0 / 3.0))  # 왼쪽 2/3만 유지
+        if new_w < 200:   # 너무 좁으면 더 이상 못 자름 (임계값은 적당히 조절)
+            break
+
+        img_nlm_work = img_nlm_work[:, :new_w]
+        img_beam_work = img_beam_work[:, :new_w]
+
+        crop_info = f"(attempt {attempt+1}: cropped to left {new_w}px from original width {w}px)"
+
 if ac_mask is not None:
     img_roi = img_beam_removed[yy0:yy1, x0:x1]
     mask_roi = ac_mask[yy0:yy1, x0:x1]
@@ -493,10 +523,9 @@ if ac_mask is not None:
         area_max=area_max,
         circ_min=circ_min,
     )
-
     overlay_roi = overlay_cells_on_roi(img_roi, cells, mask_roi=mask_roi)
     overlay_full = overlay_cells_on_full(
-        img_beam_removed,
+        img_beam_work,
         cells,
         x0,
         yy0,
@@ -519,7 +548,7 @@ else:
     st.write("AC ROI could not be detected. Adjust k, margin, or min_width.")
 
 if step == "Original":
-    st.image(img_orig, caption="Original B-scan", clamp=True)
+    st.image(img_nlm_work, caption="Original (possibly cropped for stable ROI)", clamp=True)
 
 elif step == "NLM":
     st.image(img_nlm, caption="NLM denoised", clamp=True)
