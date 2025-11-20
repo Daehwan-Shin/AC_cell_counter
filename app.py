@@ -17,6 +17,37 @@ def to_gray_np(uploaded_file):
     img = Image.open(uploaded_file).convert("L")   # grayscale
     return np.array(img)
 
+def autocrop_vertical_white(img, white_thr=250):
+    """
+    img       : 2D gray (H x W)
+    white_thr : row_mean >= white_thr 는 white background 로 간주
+    return    : (cropped_img, (y0, y1))
+    """
+    h, w = img.shape
+    row_mean = img.mean(axis=1)
+
+    # '유효한 row' = B-scan 포함된 줄
+    valid = np.where(row_mean < white_thr)[0]
+    if valid.size == 0:
+        # 전체가 흰 배경이면 그대로 반환
+        return img, (0, h)
+
+    # 연속 구간으로 쪼개기
+    segments = []
+    start = prev = valid[0]
+    for y in valid[1:]:
+        if y == prev + 1:
+            prev = y
+        else:
+            segments.append((start, prev))
+            start = prev = y
+    segments.append((start, prev))
+
+    # 가장 긴 연속 구간만 선택
+    y0, y1 = max(segments, key=lambda s: s[1] - s[0])
+
+    # crop — y1 inclusive → +1
+    return img[y0:y1+1, :], (y0, y1+1)
 
 def nlm_denoise(img, h_factor=1.15, patch_size=7, patch_distance=11):
     img_f = img.astype(np.float32) / 255.0
@@ -74,26 +105,37 @@ def refine_axis_skip_center(xs_raw,
                             beam_band=None,
                             center_pad=5,
                             max_step=4,
-                            min_len=40):
+                            min_len=40,
+                            min_center_width=24):
     """
     Remove axis points near beam + choose longest stable arc.
+
+    - beam_band 주위는 center_pad 만큼 확장해서 버리고
+    - 그 폭이 너무 좁으면 min_center_width 만큼은 무조건 버리도록 보정
     """
     xs = xs_raw.astype(float).copy()
     xs[xs <= 0] = np.nan
 
     h = len(xs)
 
-    # 1) exclude rows near beam region
+    # 1) 중앙 빔 주변 y구간 넉넉하게 제외
     if beam_band is not None:
-        y0, y1 = beam_band
-        y0 = max(0, y0 - center_pad)
-        y1 = min(h, y1 + center_pad)
-        xs[y0:y1] = np.nan
+        y0, y1 = beam_band          # 원래 빔 범위
+        mid = (y0 + y1) // 2        # 중앙
+        half = (y1 - y0) // 2 + center_pad
 
-    # 2) find stable continuous segments
+        # 최소 폭 보장 (예: 최소 24px 정도는 항상 버리도록)
+        half = max(half, min_center_width // 2)
+
+        y0 = max(0, mid - half)
+        y1 = min(h, mid + half)
+
+        xs[y0:y1] = np.nan   # 이 중앙 구간은 곡선 추정에서 완전히 제거
+
+    # 2) 남은 부분들 중에서 Δx 작은 연속 segment만 찾기
     ys = np.where(~np.isnan(xs))[0]
     if ys.size < 3:
-        return xs
+        return xs  # fallback
 
     xs_valid = xs[ys]
     dx = np.abs(np.diff(xs_valid))
@@ -118,7 +160,6 @@ def refine_axis_skip_center(xs_raw,
     xs_new = np.full_like(xs, np.nan, dtype=float)
     xs_new[ys_main] = xs_main
     return xs_new
-
 
 # -------------------------
 # Cornea/Lens mask extraction
@@ -382,6 +423,7 @@ if uploaded is None:
 
 img_orig = to_gray_np(uploaded)
 # 작업용 이미지 (필요시 오른쪽을 잘라가면서 사용)
+img_orig, (crop_y0, crop_y1) = autocrop_vertical_white(img_orig)
 img_work = img_orig.copy()
 h_img, w_img = img_orig.shape
 
