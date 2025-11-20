@@ -433,7 +433,7 @@ patch_size = st.sidebar.slider("patch size", 3, 11, 7, 2)
 patch_distance = st.sidebar.slider("patch distance", 5, 21, 11, 2)
 
 st.sidebar.header("2. Beam Removal")
-beam_half = st.sidebar.slider("Beam half thickness (rows)", 1, 30, 7)
+beam_half = st.sidebar.slider("Beam half thickness (rows)", 1, 30, 11)
 
 st.sidebar.header("3. AC ROI (annulus)")
 k_val = st.sidebar.slider("Brightness threshold k (cornea/lens)", 0.5, 4.0, 0.8, 0.1)
@@ -630,3 +630,4 @@ elif step == "Full B-scan + Cells":
         st.image(overlay_full, caption="Full scan with detected cells (red)", clamp=True)
     else:
         st.error("Full image overlay unavailable.")
+
