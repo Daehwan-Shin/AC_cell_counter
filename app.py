@@ -17,6 +17,22 @@ def to_gray_np(uploaded_file):
     img = Image.open(uploaded_file).convert("L")   # grayscale
     return np.array(img)
 
+def enhance_for_blob(img, blur_ksize=31):
+    """
+    cornea / lens detection 전에 local background를 제거해서
+    밝은 경계 구조만 강조하는 전처리.
+    """
+    img_f = img.astype(np.float32)
+    # 큰 커널로 local background 추정
+    bg = cv2.GaussianBlur(img_f, (blur_ksize, blur_ksize), 0)
+    enh = img_f - bg
+    enh[enh < 0] = 0
+
+    if enh.max() > 0:
+        enh = enh / enh.max() * 255.0
+
+    return enh.astype(np.uint8)
+
 def autocrop_vertical_white(img, white_thr=250):
     """
     img       : 2D gray (H x W)
@@ -169,9 +185,17 @@ def get_cornea_lens_masks(img, k=2.0, min_area_ratio=0.001):
     Detect 2 bright blobs (cornea & lens) by sorting blobs by x-position.
     """
     h, w = img.shape
-    mean = img.mean()
-    std  = img.std()
-    thr  = mean + k * std
+
+    # 1) local background 제거해서 cornea/lens edge 강조
+    enh = enhance_for_blob(img)   # <= 이걸로 threshold
+
+    # 2) threshold 계산
+    if use_otsu:
+        thr = threshold_otsu(enh)              # 이미지마다 자동으로 최적 threshold
+    else:
+        mean = enh.mean()
+        std  = enh.std()
+        thr  = mean + k * std                  # 여전히 k 슬라이더도 쓸 수 있게
 
     binary = img > thr
     lbl = label(binary)
@@ -445,14 +469,14 @@ if use_front_crop:
     img_work = img_orig[:, :w_front]
 else:
     img_work = img_orig.copy()
-    
+
 st.sidebar.header("1. NL-means Denoising")
 h_factor = st.sidebar.slider("h factor (noise level)", 0.5, 3.0, 1.15, 0.05)
 patch_size = st.sidebar.slider("patch size", 3, 11, 7, 2)
 patch_distance = st.sidebar.slider("patch distance", 5, 21, 11, 2)
 
 st.sidebar.header("2. Beam Removal")
-beam_half = st.sidebar.slider("Beam half thickness (rows)", 1, 30, 11)
+beam_half = st.sidebar.slider("Beam half thickness (rows)", 1, 30, 7)
 
 st.sidebar.header("3. AC ROI (annulus)")
 k_val = st.sidebar.slider("Brightness threshold k (cornea/lens)", 0.5, 4.0, 0.8, 0.1)
@@ -649,5 +673,3 @@ elif step == "Full B-scan + Cells":
         st.image(overlay_full, caption="Full scan with detected cells (red)", clamp=True)
     else:
         st.error("Full image overlay unavailable.")
-
-
