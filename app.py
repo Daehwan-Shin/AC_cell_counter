@@ -17,22 +17,6 @@ def to_gray_np(uploaded_file):
     img = Image.open(uploaded_file).convert("L")   # grayscale
     return np.array(img)
 
-def enhance_for_blob(img, blur_ksize=31):
-    """
-    cornea / lens detection 전에 local background를 제거해서
-    밝은 경계 구조만 강조하는 전처리.
-    """
-    img_f = img.astype(np.float32)
-    # 큰 커널로 local background 추정
-    bg = cv2.GaussianBlur(img_f, (blur_ksize, blur_ksize), 0)
-    enh = img_f - bg
-    enh[enh < 0] = 0
-
-    if enh.max() > 0:
-        enh = enh / enh.max() * 255.0
-
-    return enh.astype(np.uint8)
-
 def autocrop_vertical_white(img, white_thr=250):
     """
     img       : 2D gray (H x W)
@@ -180,19 +164,18 @@ def refine_axis_skip_center(xs_raw,
 # -------------------------
 # Cornea/Lens mask extraction
 # -------------------------
-def get_cornea_lens_masks(img, k=2.0, min_area_ratio=0.001):
+def get_cornea_lens_masks(img, k=2.0, min_area_ratio=0.001, dx_min_ratio=0.02):
     """
-    Detect 2 bright blobs (cornea & lens) by sorting blobs by x-position.
+    Detect 2 bright blobs (cornea & lens) by sorting blobs by x-position
+    + area heuristic.
+
+    - cornea: 가장 왼쪽 큰 blob
+    - lens: cornea 오른쪽에 있는 blob 중 area가 가장 큰 것
     """
     h, w = img.shape
-
-    # 1) local background 제거해서 cornea/lens edge 강조
-    enh = enhance_for_blob(img)   # <= 이걸로 threshold
-
-    # 2) threshold 계산
     mean = img.mean()
     std  = img.std()
-    thr  = mean + k * std               # 여전히 k 슬라이더도 쓸 수 있게
+    thr  = mean + k * std
 
     binary = img > thr
     lbl = label(binary)
@@ -208,18 +191,34 @@ def get_cornea_lens_masks(img, k=2.0, min_area_ratio=0.001):
     if len(big) < 2:
         raise RuntimeError("Not enough large bright blobs (need ≥2).")
 
-    # sort them by leftmost x (r.bbox = (y0, x0, y1, x1))
+    # x0 기준 정렬
     big_sorted = sorted(big, key=lambda r: r.bbox[1])
 
-    # leftmost = cornea, next = lens
+    # 1) cornea = 가장 왼쪽 큰 blob
     cornea_r = big_sorted[0]
-    lens_r   = big_sorted[1]
+
+    # 2) lens 후보 = cornea 보다 오른쪽에 있는 blob들 중 area가 큰 것
+    dx_min = int(w * dx_min_ratio)  # cornea에서 최소 이 정도는 떨어지도록
+    cornea_x0 = cornea_r.bbox[1]
+
+    lens_candidates = [
+        r for r in big
+        if (r.bbox[1] - cornea_x0) >= dx_min
+    ]
+
+    if not lens_candidates:
+        # fallback: 예전처럼 두 번째 blob 사용
+        if len(big_sorted) < 2:
+            raise RuntimeError("No lens candidate blob found.")
+        lens_r = big_sorted[1]
+    else:
+        # area 가장 큰 blob을 lens로
+        lens_r = max(lens_candidates, key=lambda r: r.area)
 
     cornea_mask = (lbl == cornea_r.label)
     lens_mask   = (lbl == lens_r.label)
 
     return cornea_mask, lens_mask
-
 # -------------------------
 # 1D smoothing
 # -------------------------
@@ -448,32 +447,13 @@ img_orig, (crop_y0, crop_y1) = autocrop_vertical_white(img_orig)
 img_work = img_orig.copy()
 h_img, w_img = img_orig.shape
 
-# -------------------------
-# 0. 전방(좌측) 크롭 옵션
-# -------------------------
-st.sidebar.header("0. Anterior crop")
-use_front_crop = st.sidebar.checkbox(
-    "Analyze only anterior half (left side)", value=True
-)
-front_ratio = (
-    st.sidebar.slider("Anterior width ratio", 0.3, 0.8, 0.5, 0.05)
-    if use_front_crop
-    else 1.0
-)
-
-if use_front_crop:
-    w_front = int(w_img * front_ratio)
-    img_work = img_orig[:, :w_front]
-else:
-    img_work = img_orig.copy()
-
 st.sidebar.header("1. NL-means Denoising")
 h_factor = st.sidebar.slider("h factor (noise level)", 0.5, 3.0, 1.15, 0.05)
 patch_size = st.sidebar.slider("patch size", 3, 11, 7, 2)
 patch_distance = st.sidebar.slider("patch distance", 5, 21, 11, 2)
 
 st.sidebar.header("2. Beam Removal")
-beam_half = st.sidebar.slider("Beam half thickness (rows)", 1, 30, 7)
+beam_half = st.sidebar.slider("Beam half thickness (rows)", 1, 30, 11)
 
 st.sidebar.header("3. AC ROI (annulus)")
 k_val = st.sidebar.slider("Brightness threshold k (cornea/lens)", 0.5, 4.0, 0.8, 0.1)
@@ -670,4 +650,3 @@ elif step == "Full B-scan + Cells":
         st.image(overlay_full, caption="Full scan with detected cells (red)", clamp=True)
     else:
         st.error("Full image overlay unavailable.")
-
