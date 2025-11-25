@@ -190,12 +190,9 @@ def get_cornea_lens_masks(img, k=2.0, min_area_ratio=0.001):
     enh = enhance_for_blob(img)   # <= 이걸로 threshold
 
     # 2) threshold 계산
-    if use_otsu:
-        thr = threshold_otsu(enh)              # 이미지마다 자동으로 최적 threshold
-    else:
-        mean = enh.mean()
-        std  = enh.std()
-        thr  = mean + k * std                  # 여전히 k 슬라이더도 쓸 수 있게
+    mean = img.mean()
+    std  = img.std()
+    thr  = mean + k * std               # 여전히 k 슬라이더도 쓸 수 있게
 
     binary = img > thr
     lbl = label(binary)
@@ -673,3 +670,4 @@ elif step == "Full B-scan + Cells":
         st.image(overlay_full, caption="Full scan with detected cells (red)", clamp=True)
     else:
         st.error("Full image overlay unavailable.")
+
