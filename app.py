@@ -427,6 +427,25 @@ img_orig, (crop_y0, crop_y1) = autocrop_vertical_white(img_orig)
 img_work = img_orig.copy()
 h_img, w_img = img_orig.shape
 
+# -------------------------
+# 0. 전방(좌측) 크롭 옵션
+# -------------------------
+st.sidebar.header("0. Anterior crop")
+use_front_crop = st.sidebar.checkbox(
+    "Analyze only anterior half (left side)", value=True
+)
+front_ratio = (
+    st.sidebar.slider("Anterior width ratio", 0.3, 0.8, 0.5, 0.05)
+    if use_front_crop
+    else 1.0
+)
+
+if use_front_crop:
+    w_front = int(w_img * front_ratio)
+    img_work = img_orig[:, :w_front]
+else:
+    img_work = img_orig.copy()
+    
 st.sidebar.header("1. NL-means Denoising")
 h_factor = st.sidebar.slider("h factor (noise level)", 0.5, 3.0, 1.15, 0.05)
 patch_size = st.sidebar.slider("patch size", 3, 11, 7, 2)
@@ -630,4 +649,5 @@ elif step == "Full B-scan + Cells":
         st.image(overlay_full, caption="Full scan with detected cells (red)", clamp=True)
     else:
         st.error("Full image overlay unavailable.")
+
 
