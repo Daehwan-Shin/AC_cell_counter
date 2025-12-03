@@ -6,13 +6,10 @@ from skimage.restoration import denoise_nl_means, estimate_sigma
 from skimage.filters import threshold_otsu
 from skimage.measure import label, regionprops
 from skimage.morphology import dilation, disk
-from scipy.signal import savgol_filter
-
 
 # -------------------------
 # Utility functions
 # -------------------------
-
 def to_gray_np(uploaded_file):
     img = Image.open(uploaded_file).convert("L")   # grayscale
     return np.array(img)
@@ -62,7 +59,6 @@ def nlm_denoise(img, h_factor=1.15, patch_size=7, patch_distance=11):
     )
     return (den * 255).astype(np.uint8)
 
-
 def remove_central_beam(img, band_half=3):
     """
     img: 2D gray (numpy array)
@@ -83,7 +79,6 @@ def remove_central_beam(img, band_half=3):
 
     return img2, (y0, y1)
 
-
 def get_anterior_lens_axis(lens_mask):
     """
     lens_mask: bool HxW
@@ -99,7 +94,6 @@ def get_anterior_lens_axis(lens_mask):
         xs_lens[y] = xs.min()
 
     return xs_lens
-
 
 def refine_axis_skip_center(xs_raw,
                             beam_band=None,
@@ -120,7 +114,7 @@ def refine_axis_skip_center(xs_raw,
 
     # 1) 중앙 빔 주변 y구간 넉넉하게 제외
     if beam_band is not None:
-        y0, y1 = beam_band          # 원래 빔 범위
+        y0, y1 = beam_band          # 원래 빔 범위 (band 좌표계)
         mid = (y0 + y1) // 2        # 중앙
         half = (y1 - y0) // 2 + center_pad
 
@@ -219,10 +213,10 @@ def get_cornea_lens_masks(img, k=2.0, min_area_ratio=0.001, dx_min_ratio=0.02):
     lens_mask   = (lbl == lens_r.label)
 
     return cornea_mask, lens_mask
+
 # -------------------------
 # 1D smoothing
 # -------------------------
-
 def smooth_1d(x, window=15):
     if window < 3:
         return x
@@ -231,11 +225,9 @@ def smooth_1d(x, window=15):
     k = np.ones(window, dtype=np.float32) / window
     return np.convolve(x, k, mode="same")
 
-
 # -------------------------
 # Arc interpolation
 # -------------------------
-
 def fit_cornea_arc_from_mask(mask_cornea, smooth_win=15):
     """
     Posterior cornea arc extraction
@@ -259,7 +251,6 @@ def fit_cornea_arc_from_mask(mask_cornea, smooth_win=15):
         xs_interp = smooth_1d(xs_interp, window=smooth_win)
 
     return xs_interp
-
 
 def fit_lens_arc_from_mask(mask_lens, smooth_win=15):
     """
@@ -285,7 +276,6 @@ def fit_lens_arc_from_mask(mask_lens, smooth_win=15):
 
     return xs_interp
 
-
 def get_posterior_cornea_mask(cornea_mask, dilate_r=1):
     """
     Extract posterior-most corneal boundary
@@ -307,11 +297,9 @@ def get_posterior_cornea_mask(cornea_mask, dilate_r=1):
 
     return post, xs_post
 
-
 # -------------------------
 # AC “annulus-like” ROI polygon
 # -------------------------
-
 def build_ac_mask_with_chords(img_shape,
                               xs_cornea_raw,
                               xs_lens_raw,
@@ -326,7 +314,6 @@ def build_ac_mask_with_chords(img_shape,
     xs_c[xs_c <= 0] = np.nan
     xs_l[xs_l <= 0] = np.nan
 
-    ys_all = np.arange(h)
     ys_c = np.where(~np.isnan(xs_c))[0]
     ys_l = np.where(~np.isnan(xs_l))[0]
 
@@ -367,11 +354,9 @@ def build_ac_mask_with_chords(img_shape,
 
     return mask.astype(bool)
 
-
 # -------------------------
 # Cell detection
 # -------------------------
-
 def detect_cells(binary, area_min=2, area_max=30, circ_min=0.4):
     lbl = label(binary)
     regs = regionprops(lbl)
@@ -389,7 +374,6 @@ def detect_cells(binary, area_min=2, area_max=30, circ_min=0.4):
         cells.append(r)
     return cells, lbl
 
-
 def overlay_cells_on_roi(img_roi, cells, mask_roi=None):
     base = img_roi.copy()
     if mask_roi is not None:
@@ -401,7 +385,6 @@ def overlay_cells_on_roi(img_roi, cells, mask_roi=None):
         cy, cx = r.centroid
         cv2.circle(bgr, (int(cx), int(cy)), 3, (0, 0, 255), -1)
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-
 
 def overlay_cells_on_full(img_gray, cells, x0, y0, roi_shape):
     bgr = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)
@@ -416,19 +399,16 @@ def overlay_cells_on_full(img_gray, cells, x0, y0, roi_shape):
 
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
-
-def overlay_ac_mask_on_full(img_gray, ac_mask):
+def overlay_ac_mask_on_full(img_gray, ac_mask_full):
     bgr = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)
-    ac_uint = (ac_mask.astype(np.uint8) * 255)
+    ac_uint = (ac_mask_full.astype(np.uint8) * 255)
     contours, _ = cv2.findContours(ac_uint, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cv2.drawContours(bgr, contours, -1, (0, 255, 0), 2)
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
-
 # -------------------------
 # Streamlit UI
 # -------------------------
-
 st.set_page_config(page_title="IOLMaster AC Cell Quantification (Annulus ROI)", layout="wide")
 st.title("IOLMaster Anterior Chamber Cell Quantification (Annulus-like ROI)")
 
@@ -442,7 +422,7 @@ if uploaded is None:
     st.stop()
 
 img_orig = to_gray_np(uploaded)
-# 작업용 이미지 (필요시 오른쪽을 잘라가면서 사용)
+# 작업용 이미지 (필요시 위/아래 white 영역 컷)
 img_orig, (crop_y0, crop_y1) = autocrop_vertical_white(img_orig)
 img_work = img_orig.copy()
 h_img, w_img = img_orig.shape
@@ -457,7 +437,6 @@ beam_half = st.sidebar.slider("Beam half thickness (rows)", 1, 30, 11)
 
 st.sidebar.header("3. AC ROI (annulus)")
 k_val = st.sidebar.slider("Brightness threshold k (cornea/lens)", 0.5, 4.0, 0.8, 0.1)
-margin = st.sidebar.slider("Margin from arcs (px)", 0, 10, 1)
 min_width = st.sidebar.slider("Min AC width per row (px)", 1, 40, 5)
 arc_smooth = st.sidebar.slider("Arc smoothing window (rows)", 1, 51, 15, 2)
 
@@ -486,86 +465,92 @@ img_nlm = nlm_denoise(
     patch_distance=patch_distance,
 )
 
-# 2) Beam removal
-img_beam_removed, beam_band = remove_central_beam(
+# 2) Beam removal (전체 높이 기준)
+img_beam_removed, beam_band_global = remove_central_beam(
     img_nlm,
     band_half=beam_half,
 )
 
-beam_y0, beam_y1 = beam_band
+beam_y0_global, beam_y1_global = beam_band_global
 
-# 3) AC ROI detection
 error_msg = None
-ac_mask = None
+ac_mask_full = None
+ac_mask_band = None
 img_roi = None
-yy0 = yy1 = x0 = x1 = None
+yy0_global = yy1_global = x0 = x1 = None
 cells = []
 binary = None
 overlay_roi = None
 overlay_full = None
 
-img_nlm_work = img_nlm.copy()
-img_beam_work = img_beam_removed.copy()
+# -------------------------
+# ✅ FIXED X + ANATOMICAL AC DETECTION
+# -------------------------
 
-crop_info = ""
-max_tries = 3
+error_msg = None
+cells = []
+binary = None
+overlay_roi = None
+overlay_full = None
+ac_mask_full = None
 
-for attempt in range(max_tries):
-    try:
-        # --- 이 아래는 기존 try 블록과 동일하지만
-        #     img_nlm 대신 img_nlm_work, img_beam_removed 대신 img_beam_work 사용 ---
-        cornea_mask_raw, lens_mask = get_cornea_lens_masks(img_nlm_work, k=k_val)
+H, W = img_beam_removed.shape
 
-        cornea_post_mask, xs_cornea = get_posterior_cornea_mask(cornea_mask_raw, dilate_r=1)
-        xs_lens = get_anterior_lens_axis(lens_mask)
+# ✅ (1) X = 140~300 고정
+x0 = 140
+x1 = 300
 
-        xs_cornea = refine_axis_skip_center(
-            xs_cornea,
-            beam_band=beam_band,
-            center_pad=5,
-            max_step=4,
-            min_len=40,
-        )
+# ✅ (2) Y = 전체
+yy0_global = 0
+yy1_global = H
 
-        ac_mask = build_ac_mask_with_chords(
-            img_shape=img_nlm_work.shape,
-            xs_cornea_raw=xs_cornea,
-            xs_lens_raw=xs_lens,
-            min_width=min_width,
-        )
+# ✅ (3) X-고정 ROI 안에서 AC 검출용 이미지
+img_xband_nlm = img_nlm[:, x0:x1]
+img_xband_beam = img_beam_removed[:, x0:x1]
 
-        ys, xs = np.where(ac_mask)
-        yy0 = ys.min()
-        yy1 = ys.max() + 1
-        x0  = xs.min()
-        x1  = xs.max() + 1
+try:
+    # ✅ cornea / lens detection (X-band 내부)
+    cornea_mask_raw, lens_mask = get_cornea_lens_masks(img_xband_nlm, k=k_val)
 
-        # 성공했으면 루프 탈출
-        error_msg = None
-        break
+    cornea_post_mask, xs_cornea = get_posterior_cornea_mask(cornea_mask_raw, dilate_r=1)
+    xs_lens = get_anterior_lens_axis(lens_mask)
 
-    except Exception as e:
-        error_msg = str(e)
+    # ✅ beam 주변 axis 제거
+    band_beam_band = None
+    if beam_y1_global > 0 and beam_y0_global < H:
+        band_beam_band = (beam_y0_global, beam_y1_global)
 
-        # 마지막 시도면 그냥 포기
-        if attempt == max_tries - 1:
-            break
+    xs_cornea_refined = refine_axis_skip_center(
+        xs_cornea,
+        beam_band=band_beam_band,
+        center_pad=5,
+        max_step=4,
+        min_len=40,
+    )
 
-        # 👉 오른쪽 1/3 잘라내고 다시 시도
-        h, w = img_nlm_work.shape
-        new_w = int(w * (2.0 / 3.0))  # 왼쪽 2/3만 유지
-        if new_w < 200:   # 너무 좁으면 더 이상 못 자름 (임계값은 적당히 조절)
-            break
+    # ✅ (4) annulus polygon AC mask (X-band 좌표계)
+    ac_mask_band = build_ac_mask_with_chords(
+        img_shape=img_xband_nlm.shape,
+        xs_cornea_raw=xs_cornea_refined,
+        xs_lens_raw=xs_lens,
+        min_width=min_width,
+    )
 
-        img_nlm_work = img_nlm_work[:, :new_w]
-        img_beam_work = img_beam_work[:, :new_w]
+    # ✅ (global AC mask 복원)
+    ac_mask_full = np.zeros_like(img_beam_removed, dtype=bool)
+    ac_mask_full[:, x0:x1] = ac_mask_band
 
-        crop_info = f"(attempt {attempt+1}: cropped to left {new_w}px from original width {w}px)"
+    # ✅ (5) AC ROI crop
+    ys, xs = np.where(ac_mask_full)
+    yy0_global = ys.min()
+    yy1_global = ys.max() + 1
+    x0_final = xs.min()
+    x1_final = xs.max() + 1
 
-if ac_mask is not None:
-    img_roi = img_beam_removed[yy0:yy1, x0:x1]
-    mask_roi = ac_mask[yy0:yy1, x0:x1]
+    img_roi = img_beam_removed[yy0_global:yy1_global, x0_final:x1_final]
+    mask_roi = ac_mask_full[yy0_global:yy1_global, x0_final:x1_final]
 
+    # ✅ Threshold (AC 내부 기준)
     if manual_T:
         T = T_manual
     else:
@@ -579,49 +564,53 @@ if ac_mask is not None:
     binary = np.zeros_like(full_binary)
     binary[mask_roi] = full_binary[mask_roi]
 
+    # ✅ (5) Cell detection (AC 내부)
     cells, _ = detect_cells(
         binary,
         area_min=area_min,
         area_max=area_max,
         circ_min=circ_min,
     )
+
     overlay_roi = overlay_cells_on_roi(img_roi, cells, mask_roi=mask_roi)
     overlay_full = overlay_cells_on_full(
-        img_beam_work,
+        img_beam_removed,
         cells,
-        x0,
-        yy0,
+        x0_final,
+        yy0_global,
         roi_shape=img_roi.shape,
     )
+
+except Exception as e:
+    error_msg = str(e)
 
 # -------------------------
 # Display
 # -------------------------
-
-st.write(f"Image size: **{w_img} x {h_img}** (W x H)")
+st.write(f"Image size (after vertical crop): **{w_img} x {h_img}** (W x H)")
 
 if error_msg:
     st.warning(f"AC ROI detection warning: {error_msg}")
 
 if img_roi is not None:
-    st.write(f"AC ROI coords (x0,x1,y0,y1): ({x0}, {x1}, {yy0}, {yy1})")
+    st.write(f"AC ROI coords (x0,x1,y0,y1): ({x0_final}, {x1_final}, {yy0_global}, {yy1_global})")
     st.write(f"Detected cell count: **{len(cells)}**")
 else:
-    st.write("AC ROI could not be detected. Adjust k, margin, or min_width.")
+    st.write("AC ROI could not be detected. Adjust k or min_width.")
 
 if step == "Original":
-    st.image(img_nlm_work, caption="Original (possibly cropped for stable ROI)", clamp=True)
+    st.image(img_orig, caption="Original (vertically autocropped)", clamp=True)
 
 elif step == "NLM":
     st.image(img_nlm, caption="NLM denoised", clamp=True)
 
 elif step == "Beam removed":
-    st.image(img_beam_removed, caption="Beam removed", clamp=True)
+    st.image(img_beam_removed, caption="Beam removed (whole image)", clamp=True)
 
 elif step == "AC ROI":
-    if ac_mask is not None:
-        ac_overlay = overlay_ac_mask_on_full(img_orig, ac_mask)
-        st.image(ac_overlay, caption="AC annulus-like ROI (green contour)", clamp=True)
+    if ac_mask_full is not None:
+        ac_overlay = overlay_ac_mask_on_full(img_beam_removed, ac_mask_full)
+        st.image(ac_overlay, caption="AC annulus-like ROI (green contour) on full B-scan", clamp=True)
         if img_roi is not None:
             st.image(img_roi, caption="AC ROI crop (beam removed)", clamp=True)
     else:
@@ -644,8 +633,8 @@ elif step == "AC ROI + Cells":
         st.error("ROI overlay unavailable.")
 
 elif step == "Full B-scan + Cells":
-    if overlay_full is not None and ac_mask is not None:
-        ac_overlay = overlay_ac_mask_on_full(img_beam_removed, ac_mask)
+    if overlay_full is not None and ac_mask_full is not None:
+        ac_overlay = overlay_ac_mask_on_full(img_beam_removed, ac_mask_full)
         st.image(ac_overlay, caption="Full scan with AC annulus ROI (green)", clamp=True)
         st.image(overlay_full, caption="Full scan with detected cells (red)", clamp=True)
     else:
