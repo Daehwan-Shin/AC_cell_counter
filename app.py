@@ -25,8 +25,11 @@ def get_norm_params(H, W):
         poly_iter=5,
         poly_resid_k=2.5,
         beam_pad=max(3, int(H * 0.012)),
-        cornea_thr_k=1.5,
+        cornea_thr_k=1.1,
         cell_disk=max(2, int(ref * 0.006)),
+        roi_erode=max(3, int(ref * 0.010)),
+        beam_pad_above=max(2, int(H * 0.010)),
+        beam_pad_below=max(4, int(H * 0.025)),
     )
 
 # =============================================================
@@ -67,18 +70,30 @@ def nlm_denoise(img, h_factor=1.15, patch_size=7, patch_distance=11):
     return (den * 255).astype(np.uint8)
 
 # =============================================================
-# 3. Beam removal — 연속된 bright row band 전체를 제거.
-#    기존 argmax 한 줄 기반보다 beam 이 기울거나 두꺼울 때 안정적.
+# 3. Beam removal — 연속된 bright row band 를 검출해 inpaint/median/none 처리.
+#    inpaint: 주변 행으로 보간 → cornea/lens 가 beam 을 가로질러 연속 유지.
+#    median : 단순 median 채움 (구조가 beam 위아래로 분리됨).
+#    none   : 그대로 둠 (beam 이 강하지 않은 이미지용).
 # =============================================================
-def remove_central_beam_robust(img, k=3.0, max_half=None):
+def detect_beam_band(img, k=3.0, max_half=None, percentile=95):
+    """
+    Robust beam detection:
+      1) per-row bright profile = np.percentile(row, 95)
+      2) threshold = median + k * MAD * 1.4826   (robust to speckle noise)
+    소수 bright 픽셀(noise)이나 cornea/lens 블롭의 평균 기여로 생기는
+    false beam detection 을 줄임.
+    """
     H = img.shape[0]
-    profile = img.mean(axis=1).astype(np.float32)
-    thr = profile.mean() + k * profile.std()
+    profile = np.percentile(img, percentile, axis=1).astype(np.float32)
+    med = float(np.median(profile))
+    mad = float(np.median(np.abs(profile - med))) * 1.4826 + 1e-6
+    thr = med + k * mad
     bright = profile >= thr
+
     if not bright.any():
         r0 = int(np.argmax(profile))
         half = max_half or 3
-        return img.copy(), (max(0, r0 - half), min(H, r0 + half + 1))
+        return max(0, r0 - half), min(H, r0 + half + 1)
 
     r_peak = int(np.argmax(profile))
     if not bright[r_peak]:
@@ -95,9 +110,32 @@ def remove_central_beam_robust(img, k=3.0, max_half=None):
         mid = (y0 + y1) // 2
         y0 = max(y0, mid - max_half)
         y1 = min(y1, mid + max_half + 1)
+    return y0, y1
 
-    img2 = img.copy()
-    img2[y0:y1, :] = int(np.median(img2))
+def remove_central_beam_robust(img, k=3.0, max_half=None, mode="inpaint",
+                                manual_center=None, manual_half=None):
+    H = img.shape[0]
+    if mode == "none":
+        mid = H // 2
+        return img.copy(), (mid, mid)
+
+    if mode == "manual" and manual_center is not None and manual_half is not None:
+        y0 = max(0, int(manual_center - manual_half))
+        y1 = min(H, int(manual_center + manual_half + 1))
+    else:
+        y0, y1 = detect_beam_band(img, k=k, max_half=max_half)
+    if y1 <= y0:
+        return img.copy(), (y0, y1)
+
+    if mode == "median":
+        img2 = img.copy()
+        img2[y0:y1, :] = int(np.median(img2))
+        return img2, (y0, y1)
+
+    beam_mask = np.zeros(img.shape, np.uint8)
+    beam_mask[y0:y1, :] = 1
+    radius = max(3, (y1 - y0) // 2)
+    img2 = cv2.inpaint(img, beam_mask, radius, cv2.INPAINT_TELEA)
     return img2, (y0, y1)
 
 # =============================================================
@@ -222,6 +260,12 @@ def fit_arc_polynomial(mask, side="posterior", degree=2,
 # 7. AC polygon (original 방식 유지)
 # =============================================================
 def build_ac_mask_with_chords(img_shape, xs_cornea, xs_lens, min_width=5):
+    """
+    각 arc 의 **자체 y-extent** 를 그대로 사용해 polygon 구성.
+    - cornea: top→bottom (전체)
+    - lens  : bottom→top (전체, 역순)
+    - 두 arc 의 y-range 가 달라도 끝점이 chord 로 자동 연결됨 (fillPoly 가 닫아줌).
+    """
     xs_c = xs_cornea.astype(float).copy()
     xs_l = xs_lens.astype(float).copy()
     xs_c[(xs_c <= 0) | ~np.isfinite(xs_c)] = np.nan
@@ -230,17 +274,29 @@ def build_ac_mask_with_chords(img_shape, xs_cornea, xs_lens, min_width=5):
     ys_c = np.where(~np.isnan(xs_c))[0]
     ys_l = np.where(~np.isnan(xs_l))[0]
     if ys_c.size < 2 or ys_l.size < 2:
-        raise RuntimeError("Fitted arc too short.")
+        raise RuntimeError(
+            f"Arc too short. cornea rows={ys_c.size}, lens rows={ys_l.size}."
+        )
+
+    # overlap 에서 width 통계 sanity (arc 가 뒤집혔는지 감지)
     overlap = np.intersect1d(ys_c, ys_l)
-    if overlap.size > 0 and np.all((xs_l[overlap] - xs_c[overlap]) <= min_width):
-        raise RuntimeError("AC width too narrow between cornea and lens arcs.")
+    if overlap.size > 0:
+        widths = xs_l[overlap] - xs_c[overlap]
+        if not np.any(widths > min_width):
+            raise RuntimeError(
+                f"AC width never exceeds {min_width}px. "
+                f"Widths (overlap {overlap.size} rows): "
+                f"min={widths.min():.1f}, med={np.median(widths):.1f}, "
+                f"max={widths.max():.1f}. "
+                f"Arc fits may be inverted."
+            )
 
     ys_c_s = np.sort(ys_c)
     ys_l_s = np.sort(ys_l)
     pts_c = np.stack([xs_c[ys_c_s], ys_c_s], axis=1).astype(np.int32)
     pts_l = np.stack([xs_l[ys_l_s], ys_l_s], axis=1).astype(np.int32)
 
-    poly = pts_c.tolist() + [pts_l[-1].tolist()] + pts_l[::-1].tolist() + [pts_c[0].tolist()]
+    poly = pts_c.tolist() + pts_l[::-1].tolist()
     polygon = np.array(poly, dtype=np.int32)
     mask = np.zeros(img_shape, np.uint8)
     cv2.fillPoly(mask, [polygon], 1)
@@ -362,9 +418,32 @@ use_clahe = st.sidebar.checkbox("Apply CLAHE (contrast normalize)", True)
 clahe_clip = st.sidebar.slider("CLAHE clip limit", 0.5, 5.0, 2.0, 0.1)
 h_factor = st.sidebar.slider("NLM h factor", 0.5, 3.0, 1.15, 0.05)
 
-st.sidebar.header("2. Beam removal")
-beam_k = st.sidebar.slider("Beam k (mean + k·σ)", 1.0, 6.0, float(P["beam_k"]), 0.1)
+st.sidebar.header("2. Beam handling")
+beam_mode_label = st.sidebar.selectbox(
+    "Mode",
+    ["Inpaint (auto)", "Fill median (auto)", "Manual (inpaint)", "None"],
+    index=0,
+)
+beam_mode_map = {
+    "Inpaint (auto)": "inpaint",
+    "Fill median (auto)": "median",
+    "Manual (inpaint)": "manual",
+    "None": "none",
+}
+beam_mode = beam_mode_map[beam_mode_label]
+beam_k = st.sidebar.slider(
+    "Beam k (median + k·MAD)", 1.0, 8.0, float(P["beam_k"]), 0.1,
+    help="Robust (percentile + MAD) threshold for auto beam detection.",
+)
 beam_cap = st.sidebar.slider("Beam half-width cap (rows)", 3, 80, int(P["beam_half_max"]))
+manual_center = st.sidebar.slider(
+    "Manual beam center row", 0, max(1, H - 1), H // 2,
+    disabled=(beam_mode != "manual"),
+)
+manual_half = st.sidebar.slider(
+    "Manual beam half-width", 1, max(2, H // 4), 5,
+    disabled=(beam_mode != "manual"),
+)
 
 st.sidebar.header("3. Cornea/Lens detection")
 auto_xband = st.sidebar.checkbox("Auto-detect X band", True)
@@ -373,13 +452,27 @@ x1_manual = st.sidebar.slider("Manual X1", 10, W, int(W * 0.55))
 thr_k = st.sidebar.slider("Threshold k (on CLAHE/NLM)", 0.2, 4.0,
                            float(P["cornea_thr_k"]), 0.1)
 
-st.sidebar.header("4. Arc fitting")
+st.sidebar.header("4. Arc fitting (polynomial)")
 poly_deg = st.sidebar.slider("Polynomial degree", 2, 4, int(P["poly_degree"]))
-resid_k = st.sidebar.slider("Outlier reject k·σ", 1.0, 4.0,
-                             float(P["poly_resid_k"]), 0.1)
+resid_k = st.sidebar.slider("Outlier reject k·σ",
+                             1.0, 6.0, float(P["poly_resid_k"]), 0.1)
 min_width = st.sidebar.slider("Min AC width per row (px)", 1, 40, 5)
 
-st.sidebar.header("5. Cell detection")
+st.sidebar.header("5. Boundary exclusion (cell search)")
+roi_erode = st.sidebar.slider(
+    "AC inward erosion (px)", 0, 30, int(P["roi_erode"]),
+    help="Shrink AC polygon to avoid cornea/lens/iris boundary reflections.",
+)
+beam_pad_above = st.sidebar.slider(
+    "Beam pad ABOVE (px)", 0, 60, int(P["beam_pad_above"]),
+    help="Exclusion above detected beam band (cornea posterior reflection side).",
+)
+beam_pad_below = st.sidebar.slider(
+    "Beam pad BELOW (px)", 0, 80, int(P["beam_pad_below"]),
+    help="Exclusion below detected beam band (iris/lens anterior reflection side). Usually larger than above.",
+)
+
+st.sidebar.header("6. Cell detection")
 detector = st.sidebar.radio("Method", ["Top-hat + Otsu", "LoG blob"])
 cell_disk_r = st.sidebar.slider("Cell top-hat disk radius (px)",
                                   1, 20, int(P["cell_disk"]))
@@ -403,7 +496,10 @@ step = st.radio(
 # Pipeline
 # -------------------------------------------------------------
 img_nlm = nlm_denoise(img_orig, h_factor=h_factor)
-img_beam, beam_band = remove_central_beam_robust(img_nlm, k=beam_k, max_half=beam_cap)
+img_beam, beam_band = remove_central_beam_robust(
+    img_nlm, k=beam_k, max_half=beam_cap, mode=beam_mode,
+    manual_center=manual_center, manual_half=manual_half,
+)
 img_seg = apply_clahe(img_beam, clip=clahe_clip) if use_clahe else img_beam
 
 if auto_xband:
@@ -417,7 +513,7 @@ else:
 
 status, error_msg = [], None
 cells, blobs = [], np.zeros((0, 3))
-binary = ac_mask_full = img_roi = mask_roi = None
+binary = ac_mask_full = ac_mask_search = img_roi = mask_roi = None
 cornea_mask_full = lens_mask_full = None
 xs_cornea_fit = xs_lens_fit = None
 overlay_roi_img = overlay_full_img = None
@@ -448,9 +544,12 @@ try:
         n_iter=P["poly_iter"], resid_k=resid_k, beam_band=bb,
     )
     if coef_c is None or coef_l is None:
-        raise RuntimeError("Arc fit failed (too few valid points after outlier rejection).")
+        raise RuntimeError(
+            "Polynomial arc fit failed. "
+            "Check Cornea/Lens mask step — blob may be too small or fragmented."
+        )
     status.append(f"Cornea fit residual σ = {std_c:.2f} px")
-    status.append(f"Lens fit residual σ   = {std_l:.2f} px")
+    status.append(f"Lens   fit residual σ = {std_l:.2f} px")
 
     ac_mask_band = build_ac_mask_with_chords(
         img_shape=img_band_seg.shape,
@@ -460,11 +559,35 @@ try:
     ac_mask_full = np.zeros_like(img_orig, dtype=bool)
     ac_mask_full[:, x0:x1] = ac_mask_band
 
-    ys, xs = np.where(ac_mask_full)
+    # Cell-search mask = AC polygon - boundary reflections - beam band
+    ac_mask_search = ac_mask_full.copy()
+    if roi_erode > 0:
+        se = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2 * roi_erode + 1, 2 * roi_erode + 1),
+        )
+        ac_mask_search = cv2.erode(
+            ac_mask_search.astype(np.uint8), se,
+        ).astype(bool)
+    if beam_pad_above > 0 or beam_pad_below > 0:
+        by0 = max(0, beam_band[0] - beam_pad_above)
+        by1 = min(H, beam_band[1] + beam_pad_below)
+        ac_mask_search[by0:by1, :] = False
+
+    if not ac_mask_search.any():
+        raise RuntimeError(
+            "Cell-search mask empty after boundary exclusion. "
+            "Lower AC erosion or beam pad."
+        )
+    status.append(
+        f"Cell-search area = {ac_mask_search.sum()} px² "
+        f"({100.0 * ac_mask_search.sum() / max(ac_mask_full.sum(), 1):.1f}% of AC)"
+    )
+
+    ys, xs = np.where(ac_mask_search)
     yy0, yy1 = int(ys.min()), int(ys.max() + 1)
     xx0, xx1 = int(xs.min()), int(xs.max() + 1)
     img_roi = img_beam[yy0:yy1, xx0:xx1]
-    mask_roi = ac_mask_full[yy0:yy1, xx0:xx1]
+    mask_roi = ac_mask_search[yy0:yy1, xx0:xx1]
 
     if detector == "Top-hat + Otsu":
         cells, binary, T_used = detect_cells_tophat(
@@ -549,15 +672,32 @@ elif step == "Arc fit":
                 cx = int(xl) + x0
                 if 0 <= cx < W:
                     vis[y, cx] = (255, 0, 255)
-        st.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB),
-                 caption="Yellow = cornea posterior fit, Magenta = lens anterior fit")
+        st.image(
+            cv2.cvtColor(vis, cv2.COLOR_BGR2RGB),
+            caption="Yellow = cornea posterior fit, Magenta = lens anterior fit",
+        )
     else:
         st.error(f"Arc fit unavailable. {error_msg or ''}")
 
 elif step == "AC ROI":
     if ac_mask_full is not None:
-        st.image(overlay_ac_mask(img_orig, ac_mask_full),
-                 caption="AC ROI polygon on original image", clamp=True)
+        vis = _gray_to_bgr(img_orig)
+        ac_u8 = (ac_mask_full.astype(np.uint8) * 255)
+        contours_full, _ = cv2.findContours(
+            ac_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+        )
+        cv2.drawContours(vis, contours_full, -1, (0, 255, 0), 2)
+        if ac_mask_search is not None and ac_mask_search.any():
+            ms_u8 = (ac_mask_search.astype(np.uint8) * 255)
+            contours_search, _ = cv2.findContours(
+                ms_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+            )
+            cv2.drawContours(vis, contours_search, -1, (0, 255, 255), 1)
+        st.image(
+            cv2.cvtColor(vis, cv2.COLOR_BGR2RGB),
+            caption="Green = full AC polygon, Yellow = cell-search region (after boundary exclusion)",
+            clamp=True,
+        )
         if img_roi is not None:
             st.image(img_roi, caption="AC ROI crop (beam-removed)", clamp=True)
     else:
